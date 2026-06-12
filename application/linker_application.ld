@@ -25,7 +25,7 @@ _estack = 0x20050000;    /* End of 320 KB SRAM1 */
 MEMORY
 {
   /* Starts exactly at APP_START_ADDR (1KB into Sector 2) */
-  FLASH (rx)      : ORIGIN = 0x08008000, LENGTH = 2016K  
+  FLASH (rx)      : ORIGIN = 0x08008000, LENGTH = 992K  /* Adjusted: 2048K total shared, but 1024−32 (reserved) max per bank app slot */
   RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 320K   /* SRAM1 */
 }
 
