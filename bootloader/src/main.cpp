@@ -1,5 +1,5 @@
-/**
- * BOOTLOADER FILE
+/* Bootloader with firmware update capability on dual-bank flash memory swap
+ * APPLICATION FILE
  * @file main.cpp
  * @brief STM32F469 Custom Bare-Metal C++ Bootloader
  */
@@ -64,10 +64,13 @@ using AppEntryFunction = void(*)(); // in C: typedef void (*AppEntryFunction)(vo
 // ============================================================================
 inline constexpr uint32_t BANK1_APP_START_ADDR = 0x08008000U; // Since we don't write the FW on the first two sectors
 inline constexpr uint32_t BANK2_APP_START_ADDR = 0x08108000U; // Pushed from 12 originally to 14th sector to get symmetry with Bank 1
+// Total Isolation: because the linker doesn't know these addresses exist, it will never try to compile code into them.
 inline constexpr uint32_t SECTOR12_START = 0x08100000U; // Eeprom-like sector to store any user data
 inline constexpr uint32_t SECTOR12_END   = 0x08104000U; // Boundary limit
-inline constexpr uint32_t SECTOR13_START = 0x08104000U; // Eeprom-like sector to store to which Bank the application will run
+inline constexpr uint32_t SECTOR13_START = 0x08104000U; // Non-volatile sector that store linearly the Bank number the application currently runs on
 inline constexpr uint32_t SECTOR13_END   = 0x08108000U;
+inline constexpr uint32_t SECTOR13_MAGIC_ADDR = 0x08107FFCU; // Last 32-bit word of Sector 13
+inline constexpr uint32_t SECTOR13_MAGIC_VAL  = 0x1A2B3C4DU; // Your chosen initialization token
 
 // Explicit physical layout of STM32F469 Bank 1
 // Sized to 12 sectors total (Sector 0 to 11)
@@ -136,9 +139,9 @@ static void flash_unlock() {
     }
 }
 
-/*static void flash_lock() {
+static void flash_lock() {
     FLASH->CR |= FLASH_CR_LOCK;  // Re-engage the hardware lock guard
-}*/
+}
 
 static void flash_erase_sector(uint32_t sector)
 {
@@ -230,11 +233,20 @@ static uint8_t get_active_bank_choice() {
     return STATE_RUN_BANK1;
 }
 
+static void format_sector13_fresh(uint8_t initial_state) {
+    flash_unlock();
+    flash_erase_sector(13); // Wipes the whole 16KB to 0xFF automatically
+    flash_write(SECTOR13_START, initial_state);  // Write the starting bank choice at the very first byte
+    flash_write(SECTOR13_MAGIC_ADDR, SECTOR13_MAGIC_VAL);  // Write the magic word at the very last 32-bit word
+}
+
+
 static void record_new_bank_state(uint8_t new_state) {
+	// Wear-Leveling byte-by-byte linear scanning strategy inside Sector 13
     uint32_t address = SECTOR13_START;
     flash_unlock();
 
-    while (address < SECTOR13_END) {
+    while (address < SECTOR13_MAGIC_ADDR) {
         uint8_t current_byte = *reinterpret_cast<volatile uint8_t*>(address);
 
         if (current_byte == 0xFF) {
@@ -244,11 +256,11 @@ static void record_new_bank_state(uint8_t new_state) {
         }
         address++; // Advance byte by byte
     }
-    // Fallback safeguard: If Sector 13 is completely packed full (all 16KB),
-    // we must erase it and reset to the beginning.
-    flash_erase_sector(13); //
-    flash_write(SECTOR13_START, new_state);
+    // Fallback safeguard: if Sector 13 is completely packed full (all 16KB),
+    // we must erase it and reset to the beginning
+    format_sector13_fresh(new_state);
 }
+
 
 static bool program_packet_to_flash(uint32_t start_address, std::span<const uint8_t> payload) {
     // Ensure our length is a multiple of 4 bytes to avoid partial word writes
@@ -358,10 +370,10 @@ void execute_flash_and_respond() {
 
         // 3. Check if this was the absolute last packet of the file
         if (tot_fw_bytes_written >= header.total_size) {
-            // The update is 100% complete and verified. Now it is safe to change the boot choice!
+            // The update is 100% complete, written and verified. Now it is safe to change the boot choice!
             uint8_t bank_choice = (target_is_bank2) ? 0x02 : 0x01;
-            record_new_bank_state(bank_choice);
-
+            record_new_bank_state(bank_choice); // update the new bank number the app will run onto
+            flash_lock();
             tot_fw_bytes_written = 0; // Reset counter for the next future update session
         }
         // If the transfer is interrupted, the 0x0A (force update) flag stays active in Sector 13, meaning if the board reboots,
@@ -373,10 +385,6 @@ void execute_flash_and_respond() {
         // Hardware fault during programming
         uart3.UART_Transmit_IT(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
     }
-
-    // Optional: Lock flash here if you want strict safety between packets,
-    // but leaving it unlocked until the end of the update session is also completely fine.
-    // flash_lock();
 }
 
 static void ParseIncomingStream(std::span<const uint8_t> incoming_chunk) {
@@ -517,19 +525,25 @@ void jump_to_application() {
 // =================== MAIN () ======================================
 //===================================================================
 int main() {
-    // 1. Core hardware initialization
-    SysClockConfig(); //
-    SysTick_Init();   //
-    GPIO_Config();    //
+	// 1. Core hardware initialization
+	SysClockConfig(); //
+	SysTick_Init();   //
+	GPIO_Config();    //
 
-    // 2. Read our persistent flash marker
-    uint8_t boot_state = get_active_bank_choice();
+	// Fast autonomous magic check: read the absolute end of the sector. If it's not our token, reset the sector
+	if (*reinterpret_cast<volatile uint32_t*>(SECTOR13_MAGIC_ADDR) != SECTOR13_MAGIC_VAL) {
+		// The sector 13 must be initialized at 0xFF at the first use after programming
+		format_sector13_fresh(STATE_RUN_BANK1); // Force a clean format (bank x [...0xFF...0xFF...] magic_nb)
+	}
 
-    // 3. Condition Check: Only jump if we are NOT forcing an update!
-    if (boot_state == STATE_RUN_BANK1 || boot_state == STATE_RUN_BANK2) {
-        // jump_to_application() handles remapping internally based on current execution bank
-        jump_to_application();
-    }
+	// 2. Read our persistent flash marker
+	uint8_t boot_state = get_active_bank_choice();
+
+	// 3. Condition Check: Only jump if we are NOT forcing an update!
+	if (boot_state == STATE_RUN_BANK1 || boot_state == STATE_RUN_BANK2) {
+		// jump_to_application() handles remapping internally based on current execution bank
+		jump_to_application();
+	}
 
     // 4. BYPASS / FALLBACK: If boot_state was 0x0A (or flash was corrupted),
     // we bypass the jump entirely and wait for the bytes over UART.
@@ -547,16 +561,23 @@ int main() {
 
 
 /*
+ Every time the board powers up or undergoes a hard reset, your code executes this exact sequence:
+    The Magic Check: The CPU checks a single address (0x08107FFC).
+    The Self-Heal (Day 1): If the board just came off the factory assembly line and is filled with noise/zeros,
+    the magic number isn't there. The bootloader immediately calls format_sector13_fresh(),
+    erasing the entire sector to a pristine physical 0xFF state, stamps the first byte with 0x01 (Bank 1), and seals the end with 0x1A2B3C4D.
+    The Instant Jump: If the magic number is there (Normal Day 2+ operation), it skips the formatting entirely,
+    reads the current active bank choice from your sequential list, sets the SYSCFG->MEMRMP hardware mapping steering wheel,
+    resets the stack pointer, and leaps into your main application in less than a microsecond.
+
 FB_MODE is volatile. It resets to 0 every single time the chip loses power or undergoes a power-on reset.
 If we rely only on the volatile FB_MODE bit inside jump_to_application(), then a simple power cycle would make the chip wake up,
 default back to Bank 1 mapping, and boot right back into the old Bank 1 application. Your new Bank 2 application would be stranded!
 
-Let’s solve this architectural puzzle together by showing how our Sector 13 persistent memory fixes this problem permanently.
-How Sector 13 Saves the Day After a Power Cycle
-
+-> How Sector 13 Saves the Day After a Power Cycle
 Because Sector 13 is non-volatile physical flash, its contents survive power cuts, battery drains, and hard resets perfectly.
 When you turn on the power, the STM32F469 wakes up, FB_MODE is 0, and the CPU starts executing your bootloader from the beginning of physical Bank 1.
-Here is exactly how main() uses Sector 13 to handle a cold power-on start:
+Here is how main() uses Sector 13 to handle a cold power-on start:
 
     The Power Turns On: The MCU boots natively into Bank 1. main() starts executing.
     The Non-Volatile Check: main() immediately calls get_active_bank_choice(), which reads physical Sector 13.
