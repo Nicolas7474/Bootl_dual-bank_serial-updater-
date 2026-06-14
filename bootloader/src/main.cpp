@@ -270,7 +270,7 @@ static bool program_packet_to_flash(uint32_t start_address, std::span<const uint
     }
     uint32_t target_address = start_address;
 
-    // C++20 Range-based loop jumping 4 bytes at a time
+    // Loop jumping 4 bytes at a time
     for (size_t offset = 0; offset < payload.size(); offset += 4) {
         uint32_t word = 0;
 
@@ -303,6 +303,7 @@ void execute_flash_and_respond() {
 
     // 2. Reset tracking fields cleanly if this is the absolute beginning of a transfer
     if (header.packet_id == 1) {							// first packet
+    	tot_fw_bytes_written = 0; // Reset tracking counter (robustness: avoid accumulating values if transfer has crashed)
     	uint8_t active_bank = get_active_bank_choice();
 
     	// If we are currently in a forced update state, find out what the underlying active bank was
@@ -548,8 +549,8 @@ static void jump_to_application(uint32_t target_app_addr) {
     app_reset_handler();
 }
 
-[[maybe_unused]]
-static void write_0xA() {
+// function just in case we need to force an update byte in sector 13
+[[maybe_unused]] static void write_0xA() {
     uint32_t address = 0x08104000U; // Sector 13 start address
     constexpr uint32_t sector_boundary = 0x08107FFCU;
 
@@ -604,8 +605,8 @@ int main() {
 		// jump_to_application() handles remapping internally based on current execution bank
 		jump_to_application(BANK1_APP_START_ADDR);
 	}
-    // 4. BYPASS / FALLBACK: If boot_state was 0x0A (or flash was corrupted),
-    // we bypass the jump entirely and wait for the bytes over UART.
+
+    // 4.  Wait for firmware update
     BareM_StatusTypeDef res = uart3.init(115200);
     while(res != Bare_OK);
 
@@ -614,7 +615,7 @@ int main() {
     while (true) {
 
     	GPIOD->ODR ^= GPIO_ODR_OD4;
-    	NBdelay_ms(150);
+    	NBdelay_ms(150); // blink wait to receive the uart bytes
 
     }
 
