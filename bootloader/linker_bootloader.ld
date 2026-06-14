@@ -72,6 +72,23 @@ SECTIONS
     PROVIDE_HIDDEN (__fini_array_end = .);
   } >FLASH
 
+/* ====================================================================== */
+  /* NEW: .RamFunc Section configuration                                   */
+  /* ====================================================================== */
+  _siramfunc = LOADADDR(.RamFunc);
+
+  .RamFunc :
+  {
+    . = ALIGN(4);
+    _sramfunc = .;        /* Symbol for startup code: start destination in RAM */
+    *(.RamFunc)
+    *(.RamFunc*)
+    . = ALIGN(4);
+    _eramfunc = .;        /* Symbol for startup code: end destination in RAM */
+  } >RAM AT> FLASH
+
+  /* ====================================================================== */
+  
   /* Used by the startup assembly code to initialize data from FLASH to RAM */
   _sidata = LOADADDR(.data);
 

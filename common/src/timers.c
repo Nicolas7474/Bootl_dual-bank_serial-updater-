@@ -199,6 +199,6 @@ void RTC_WKUP_IRQHandler()
     {									// 1: Wakeup timer configuration update allowed
     	GPIOK->ODR ^= GPIO_ODR_OD3; //toggle PK3 (bleu)
     	RTC->ISR = ~RTC_ISR_WUTF; // (0U<<10); this flag is cleared by software by writing 0
-    	countWakeUp++;
+
     }
 }

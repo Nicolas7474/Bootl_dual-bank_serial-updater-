@@ -114,6 +114,7 @@ void GPIO_Config (void)
 	GPIOG->MODER &= ~(3<<26);  // pin PG13 as Output
 	GPIOG->MODER |= (1<<26);  // pin PG13 as Output
 	GPIOD->MODER |= (1<<8);  // pin PD4 as Output (01) - Orange Led
+	GPIOD->MODER |= (1<<10);  // pin PD4 as Output (01) - Rouge Led
 	GPIOA->MODER &= ~(3U << (8 * 2)); // PA8 in input mode
 
 	// 3. Configure the OUTPUT MODE
@@ -129,6 +130,7 @@ void GPIO_Config (void)
 	GPIOG->OSPEEDR &= ~(3U << (26)); // PG13 Low Speed
 	GPIOG->BSRR = (1U << 13); // set the PG13 to #1
 	GPIOD->OTYPER &= ~(1 << 4); // orange Led PD4 in P-P
+	GPIOD->OTYPER &= ~(1 << 5); // rouge Led PD4 in P-P
 	GPIOA->PUPDR &= ~(3U << (8 * 2)); // PA8 01: Pull-up
 	GPIOA->PUPDR |= (1 << (8 * 2)); // PA8 01: Pull-up
 }
@@ -136,32 +138,14 @@ void GPIO_Config (void)
 
 void InterruptGPIO_Config (void)
 {
-	RCC->APB2ENR |= (1<<14);  // Enable SYSCFGEN: System configuration controller clock enable
-	SYSCFG->EXTICR[0] &= ~(0xF<<0);  // Bits[7:6:5:4] = (0:0:0:0) -> configure EXTI1 line for PA1; SYSCFG external interrupt configuration register 1 (SYSCFG_EXTICR1)
-	EXTI->IMR |= (1<<0);  // Bit[0] = 1  --> Disable the Mask on EXTI 1 (Interrupt mask register (EXTI_IMR))
+	RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;  // Enable SYSCFGEN: System configuration controller clock enable
+	SYSCFG->EXTICR[0] &= ~(0xF<<0); // Select Port A for EXTI0
+	EXTI->PR = (1 << 0); // clear pending flag
+	EXTI->IMR |= (1<<0);  // Unmask EXTI line 0
 	EXTI->RTSR |= (1<<0);  // Enable Rising Edge Trigger for PA0 (Rising trigger selection register (EXTI_RTSR))
 	EXTI->FTSR &= ~(1<<0);  // Disable Falling Edge Trigger for PA0 (Falling trigger selection register (EXTI_FTSR))
 	NVIC_SetPriority(EXTI0_IRQn, 10);
 	NVIC_EnableIRQ(EXTI0_IRQn);
-
-	//SYSCFG->EXTICR[1] &= ~(0xF<<8);  // Bits[8:9:10:] = (0:0:0:0) -> configure EXTI1 line for PA1; SYSCFG external interrupt configuration register 1 (SYSCFG_EXTICR1)
-	SYSCFG->EXTICR[3] &= ~(0xF<<0); // first, clear the  bits / EXTI12 is in EXTICR[3], bits [3:0] / SYSCFG external interrupt configuration register 3
-	SYSCFG->EXTICR[3] |= (1<<0); // Set Port B (0001); These bits are written by software to select the source input for the EXTIx	external interrupt
-	EXTI->IMR |= (1<<12);  // Bit[0] = 1  --> Disable the Mask on EXTI 1 (Interrupt mask register (EXTI_IMR))
-	EXTI->RTSR |= (1<<12);  //  interrupt when button released - Enable Rising Edge Trigger for PB12 (Rising trigger selection register (EXTI_RTSR))
-	EXTI->FTSR |= (1<<12); // Rotary encoder switch - interrupt when button pushed - - Enable Rising Edge Trigger
-	NVIC_SetPriority(EXTI15_10_IRQn, 9);
-	NVIC_EnableIRQ(EXTI15_10_IRQn);
-
-	//Map PA8 to EXTI8
-	SYSCFG->EXTICR[2] &= ~(0xF);
-	SYSCFG->EXTICR[2] |=  (0x0); 	// Writing 0 to the first 4 bits selects Port A for Line 8.
-	// Configure EXTI Line 8
-	EXTI->IMR |= (1 << 8);    // Unmask (enable) Interrupt Line 13
-	EXTI->FTSR |= (1 << 8);   // Enable Falling Edge Trigger (detects Grounding)
-	EXTI->RTSR |= (1 << 8);  // Enable Rising Edge
-	NVIC_SetPriority(EXTI9_5_IRQn, 15);
-	NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
 

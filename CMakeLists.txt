@@ -31,9 +31,13 @@ set(GLOBAL_COMPILER_FLAGS
     -Wextra
     -Wpedantic
     -ffunction-sections	# Places each function in its own section (helps linker strip unused code)
-    -fdata-sections		# Places each data item in its own section
-    -fno-exceptions		# Disables C++ exception handling overhead
-    -fno-rtti			# Disables C++ Run-Time Type Information overhead
+    -fdata-sections		# Places each data item in its own section		
+)
+
+# Separate options to avoid warning message "....is valid for C++/D/ObjC++ but not for C"
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions> 	# Disables C++ exception handling overhead
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>		# Disables C++ Run-Time Type Information overhead
 )
 
 # Aggregate all linker flags

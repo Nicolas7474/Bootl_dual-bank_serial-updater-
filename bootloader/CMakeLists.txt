@@ -4,7 +4,7 @@
 # This tells CMake to compile main.cpp and the assembly startup file into an executable named 'bootloader'
 add_executable(bootloader
     src/main.cpp  
-    src/startup_stm32f469nihx.s
+    src/startup_stm32f469nihx.s   
     "${CMAKE_SOURCE_DIR}/vendor/CMSIS_Device/system_stm32f4xx.c"
 )
 

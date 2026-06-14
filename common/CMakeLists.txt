@@ -14,8 +14,7 @@ target_include_directories(common_drivers PUBLIC
 # 3. Source files belonging to this library
 # Right now, you only have headers, so we leave this empty. 
 # As you write bare-metal C++ source files, you will list them here.
-target_sources(common_drivers PRIVATE
-   src/crc.cpp
+target_sources(common_drivers PRIVATE  
    src/myConfig.c
    src/timers.c
    src/uart3.cpp  

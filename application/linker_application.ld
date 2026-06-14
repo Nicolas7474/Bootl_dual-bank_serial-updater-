@@ -7,7 +7,7 @@ _estack = 0x20050000;    /* End of 320 KB SRAM1 */
 /* Define memory regions tailored for the Main Application */
 MEMORY
 {
-  FLASH (rx)      : ORIGIN = 0x08008000, LENGTH = 992K  (1024 - 2x16)
+  FLASH (rx)      : ORIGIN = 0x08008000, LENGTH = 992K  /* (1024 - 2x16) */
   RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 320K   
 }
 

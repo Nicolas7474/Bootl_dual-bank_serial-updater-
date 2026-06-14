@@ -73,6 +73,26 @@ Reset_Handler:
 /* Call the clock system initialization function.*/
   bl  SystemInit
 
+/* ========================================================================== */
+/* 	NEW: Copy the RamFunc segment from FLASH to SRAM                           */
+/* ========================================================================== */
+  ldr r0, =_sramfunc
+  ldr r1, =_eramfunc
+  ldr r2, =_siramfunc
+  movs r3, #0
+  b LoopCopyRamFunc
+
+CopyRamFunc:
+  ldr r4, [r2, r3]
+  str r4, [r0, r3]
+  adds r3, r3, #4
+
+LoopCopyRamFunc:
+  adds r4, r0, r3
+  cmp r4, r1
+  bcc CopyRamFunc
+/* ========================================================================== */
+
 /* Copy the data segment initializers from flash to SRAM */
   ldr r0, =_sdata
   ldr r1, =_edata

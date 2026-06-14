@@ -429,6 +429,7 @@ void USART3_IRQHandler() {
 	}
 	// Aggressive error clearing
 	if (uart3.config.usart->SR & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
+		GPIOD->ODR ^= GPIO_ODR_OD5;
 		volatile uint32_t dummy_sr = uart3.config.usart->SR;
 		volatile uint32_t dummy_dr = uart3.config.usart->DR;
 		(void)dummy_sr;
