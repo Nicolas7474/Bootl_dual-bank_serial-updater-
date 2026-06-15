@@ -9,6 +9,7 @@ import serial
 PACKET_START_BYTE = b'\x02'
 ACK_BYTE = b'\x06'
 NAK_BYTE = b'\x15'
+ERR_BYTE = b'\xEE'
 PAYLOAD_MAX_SIZE = 512
 
 def calc_stm32_crc32(data: bytes) -> int:
@@ -19,7 +20,6 @@ def calc_stm32_crc32(data: bytes) -> int:
     """
     # zlib returns an unsigned 32-bit int, exactly what we need
     return zlib.crc32(data) & 0xFFFFFFFF
-
 
 def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
     if not os.path.exists(bin_file_path):
@@ -98,18 +98,24 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
             # Wait for handshake response byte back from Bootloader
             response = ser.read(1) # 1 byte - with timeout=3.0
 
-            if response == ACK_BYTE:
-                print("ACK received!")
+            if response == ACK_BYTE:                 
+                print("ACK received !")    
+                if(packet_id == total_packets):
+                    print("Transfer completed !")         
                 bytes_sent += payload_len
                 packet_id += 1
                 success = True
             elif response == NAK_BYTE:
                 retry_count += 1
-                print(f"NAK received! Retrying ({retry_count}/{max_retries})...")
+                print(f"NAK received!  Retrying ({retry_count}/{max_retries})...")
                 time.sleep(0.1) # back off for a few ms before to re-sending the same packet
+            elif response == ERR_BYTE:                
+                print("ERR received: Write-to-Flash error. Please reboot.")
+                ser.close()
+                sys.exit(1)
             else:
                 retry_count += 1
-                print(f"Timeout/No response! Retrying ({retry_count}/{max_retries})...")
+                print(f"Timeout/No response ! Retrying ({retry_count}/{max_retries})...")
                 time.sleep(0.2)
 
         if not success:
@@ -117,8 +123,7 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
             ser.close()
             sys.exit(1)
 
-    print("\n--- Upload Successful! ---")
-    print(f"Total processed bytes successfully written: {bytes_sent}/{total_size}")
+    print(f"\nTotal processed bytes successfully uploaded: {bytes_sent}/{total_size}")
     
     # If this was the last packet, the bootloader automatically runs:
     # record_new_bank_state() followed by a system lock. 

@@ -450,7 +450,7 @@ void execute_flash_and_respond() {
     			tot_fw_bytes_written = 0;
     			transfer_in_progress = false;
     			// Blast back a NAK or an explicit ERR_BYTE so Python flags a flashing failure
-    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ERR_BYTE), 1));
+    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE_BYTE), 1));
     			return;
     		}
     	}
