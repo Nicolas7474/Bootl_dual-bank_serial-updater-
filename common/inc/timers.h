@@ -34,10 +34,7 @@ uint32_t GetSysTick(void);
 #endif
 
 
-
-
-
 extern volatile uint32_t msTicks;
-
-extern unsigned int countWakeUp;
+extern volatile uint32_t ms_since_last_packet;
+extern volatile uint8_t transfer_in_progress;
 

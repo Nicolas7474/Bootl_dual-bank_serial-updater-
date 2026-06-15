@@ -3,14 +3,13 @@
 #include "timers.h"
 
 
-unsigned int countWakeUp = 0;  // extern
-int flagmsTicks = 0;  // extern
+//
+volatile uint32_t ms_since_last_packet = 0;
+volatile uint8_t transfer_in_progress = 0;
+volatile uint32_t msTicks = 0; // Volatile ensures the compiler doesn't optimize out reads of this value
 
 //******************************************************************************************************************************
 
-// HAL_GetTick()This is often used to create a non-blocking delay or a timeout:
-
-volatile uint32_t msTicks = 0; // Volatile ensures the compiler doesn't optimize out reads of this value
 
 /*2. The Configuration
 In your initialization code, you need to configure SysTick to trigger an interrupt every 1 millisecond.
@@ -26,11 +25,13 @@ void SysTick_Init() {
     }
 }
 
-/*3. The Handler (ISR)
-The SysTick handler is predefined in the vector table. You just need to define it and increment your counter.
- */
+
+// The SysTick handler is predefined in the vector table
 void SysTick_Handler(void) {
 	msTicks++;
+	if (transfer_in_progress) {
+		ms_since_last_packet++;
+	}
 }
 
 /*4. The GetTick Equivalent : now, create a function to return that value. This is a direct replacement for HAL_GetTick().*/

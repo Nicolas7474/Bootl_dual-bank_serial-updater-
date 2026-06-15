@@ -104,7 +104,7 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
             elif response == NAK_BYTE:
                 retry_count += 1
                 print(f"NAK received! Retrying ({retry_count}/{max_retries})...")
-                time.sleep(0.1)
+                time.sleep(0.1) # back off for a few ms before to re-sending the same packet
             else:
                 retry_count += 1
                 print(f"Timeout/No response! Retrying ({retry_count}/{max_retries})...")

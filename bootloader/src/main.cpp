@@ -113,6 +113,7 @@ PacketHeader header = {0, 0, 0};
 uint8_t payload_buffer[512]; // Matches our max expected packet size
 uint32_t incoming_crc = 0;
 uint32_t bytes_read = 0;
+constexpr uint32_t INACTIVITY_TIMEOUT_MS = 4000; // 4 seconds of silence = abort
 
 std::array<uint8_t, 1024> buffer_rx{}; // Sized to 1024 to easily hold a full 512-byte payload packet + protocol framing
 
@@ -140,9 +141,9 @@ static void flash_lock() {
     FLASH->CR |= FLASH_CR_LOCK;  // Re-engage the hardware lock guard
 }
 
-static void flash_erase_sector(uint32_t sector)
+static bool flash_erase_sector(uint32_t sector)
 {
-    if (sector == 0 || sector == 1) return; // Bank 1 Bootloader sectors cannot be erased
+    if (sector == 0 || sector == 1) return false; // Bank 1 Bootloader sectors cannot be erased
     while (FLASH->SR & FLASH_SR_BSY);
     // Clear previous errors by writing 1 to them
     FLASH->SR |= FLASH_SR_PGSERR | FLASH_SR_PGPERR | FLASH_SR_PGAERR | FLASH_SR_WRPERR;
@@ -153,7 +154,6 @@ static void flash_erase_sector(uint32_t sector)
     if (sector >= 12) {
         snb_value = 16 + (sector - 12); // Adjusts 12->16, 13->17, etc., for Bank 2 hardware
     }
-    // ----------------------------
 
     FLASH->CR |= (snb_value << FLASH_CR_SNB_Pos);
     FLASH->CR |= FLASH_CR_SER; // Sector Erase activated
@@ -161,6 +161,15 @@ static void flash_erase_sector(uint32_t sector)
 
     while (FLASH->SR & FLASH_SR_BSY);
     FLASH->CR &= ~FLASH_CR_SER;
+
+    // Check if any error flags were pulled high during the erase process
+    if ((FLASH->SR & (FLASH_SR_WRPERR | FLASH_SR_PGAERR | FLASH_SR_PGPERR | FLASH_SR_PGSERR)) != 0) {
+    	// Clear flags so the hardware doesn't lock up future attempts
+    	FLASH->SR |= FLASH_SR_PGSERR | FLASH_SR_PGPERR | FLASH_SR_PGAERR | FLASH_SR_WRPERR;
+    	return false; // Erase failed
+    }
+
+    return true; // Erase succeeded cleanly
 }
 
 
@@ -234,18 +243,22 @@ static uint8_t get_active_bank_choice() {
 
 
 static void format_sector13_fresh(uint8_t initial_state) {
-    flash_unlock();
-    GPIOD->ODR ^= GPIO_ODR_OD5;
-    flash_erase_sector(13); // Wipes the whole 16KB to 0xFF automatically
-    flash_write(SECTOR13_START, initial_state);  // Write the starting bank choice at the very first byte
-    flash_write(SECTOR13_MAGIC_ADDR, SECTOR13_MAGIC_VAL);  // Write the magic word at the very last 32-bit word
+	flash_unlock();
+	// Attempt physical erasure and verify success
+	if (!flash_erase_sector(13)) {
+		// HARDWARE ERASE FAULT: Stop everything!
+		flash_lock();
+		uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+		return; // Break out of execution early to prevent programming un-erased memory
+	}
+	flash_write(SECTOR13_START, initial_state);  // Write the starting bank choice at the very first byte
+	flash_write(SECTOR13_MAGIC_ADDR, SECTOR13_MAGIC_VAL);  // Write the magic word at the very last 32-bit word
 }
-
 
 static void record_new_bank_state(uint8_t new_state) {
 	// Wear-Leveling byte-by-byte linear scanning strategy inside Sector 13
-    uint32_t address = SECTOR13_START;
-    flash_unlock();
+	uint32_t address = SECTOR13_START;
+	flash_unlock();
 
     while (address < SECTOR13_MAGIC_ADDR) {
         uint8_t current_byte = *reinterpret_cast<volatile uint8_t*>(address);
@@ -346,26 +359,31 @@ void execute_flash_and_respond() {
     // 3.2. Scan our lookup table to find which exact sector contains our ending byte
     // Choose the correct sector lookup table based on our target bank
     if (target_is_bank2) {
-        for (const auto& sector_info : bank2_sectors) {
-            if (packet_end_address >= sector_info.start_address) {
-                target_sector = sector_info.sector_number;
-                sector_found = true;
-            }
-        }
-        // Safeguard: Protect Sector 12 and 13 (the EEPROM storage space) from being overwritten by an app update
-        if (sector_found && target_sector <= 13) {
-            sector_found = false;
-        }
+    	// Search backwards from the highest sector to the lowest
+    	for (int i = bank2_sectors.size() - 1; i >= 0; --i) {
+    		if (packet_end_address >= bank2_sectors[i].start_address) {
+    			target_sector = bank2_sectors[i].sector_number;
+    			sector_found = true;
+    			break; // Stop immediately! We found the highest matching boundary.
+    		}
+    	}
+    	// Safeguard: Protect Sector 12 and 13 (the EEPROM storage space) from being overwritten by an app update
+    	if (sector_found && target_sector <= 13) {
+    		sector_found = false;
+    	}
     } else {
-        for (const auto& sector_info : bank1_sectors) {
-            if (packet_end_address >= sector_info.start_address) {
-                target_sector = sector_info.sector_number;
-                sector_found = true;
-            }
-        }
-        if (sector_found && target_sector <= 1) {
-            sector_found = false; // Redundant safeguard forcing to false, refusing to erase or write
-        }
+    	// Search backwards from the highest sector to the lowest
+    	for (int i = bank2_sectors.size() - 1; i >= 0; --i) {
+    		if (packet_end_address >= bank2_sectors[i].start_address) {
+    			target_sector = bank2_sectors[i].sector_number;
+    			sector_found = true;
+    			break; // Stop immediately! We found the highest matching boundary.
+    		}
+    	}
+
+    	if (sector_found && target_sector <= 1) {
+    		sector_found = false; // Redundant safeguard forcing to false, refusing to erase or write
+    	}
     }
 
     // Always unlock flash right before any modification attempts (Erase OR Write)
@@ -373,12 +391,18 @@ void execute_flash_and_respond() {
 
     // 3.3 If we successfully mapped the address to a sector, check our erasure tracker
     if (sector_found) {
-        // For Bank 1, sectors go 2 to 11. For Bank 2, they go 12 to 23.
-        // This condition still holds true as long as we process sequentially upward.
-        if (static_cast<int16_t>(target_sector) > last_erased_sector) {
-            flash_erase_sector(target_sector);
-            last_erased_sector = static_cast<int16_t>(target_sector);
-        }
+    	// For Bank 1, sectors go 2 to 11. For Bank 2, they go 12 to 23.
+    	// This condition still holds true as long as we process sequentially upward.
+    	if (static_cast<int16_t>(target_sector) > last_erased_sector) {
+    		// Attempt physical erasure and verify success
+    		if (!flash_erase_sector(target_sector)) {
+    			// HARDWARE ERASE FAULT: Stop everything!
+    			flash_lock();
+    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+    			return; // Break out of execution early to prevent programming un-erased memory
+    		}
+    		last_erased_sector = static_cast<int16_t>(target_sector);
+    	}
     }
 
     // 3.4. Finally write the new firmware to the Flash
@@ -395,12 +419,12 @@ void execute_flash_and_respond() {
             record_new_bank_state(bank_choice); // update the new bank number the app will run onto
             flash_lock();
             tot_fw_bytes_written = 0; // Reset counter for the next future update session
+            transfer_in_progress = 0;
             uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
             // Clean the hardware pipeline before leaving
             while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
             while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
             __disable_irq(); // Nothing can interrupt the reboot
-
             NVIC_SystemReset(); // Reboot
         }
         // If the transfer is interrupted, the 0x0A (force update) flag stays active in Sector 13, meaning if the board reboots,
@@ -415,68 +439,70 @@ void execute_flash_and_respond() {
 }
 
 static void ParseIncomingStream(std::span<const uint8_t> incoming_chunk) {
-    if (incoming_chunk.empty()) return;
+	if (incoming_chunk.empty()) return;
 
-    for (uint8_t byte : incoming_chunk) {
+	for (uint8_t byte : incoming_chunk) {
 
-        switch (current_state) {
+		switch (current_state) {
 
-            case State::IDLE_START: {
-                if (byte == PACKET_START_BYTE) {
-                    bytes_read = 0;
-                    current_state = State::READ_HEADER;
-                }
-                break;
-            }
+		case State::IDLE_START: {
+			if (byte == PACKET_START_BYTE) {
+				bytes_read = 0;
+				transfer_in_progress = 1; // Mark that we are alive
+				ms_since_last_packet = 0;    // Reset inactivity countdown
+				current_state = State::READ_HEADER;
+			}
+			break;
+		}
 
-            case State::READ_HEADER: {
-                static uint8_t header_raw[8];
-                header_raw[bytes_read++] = byte;
-                if (bytes_read == 8) {
-                    header.total_size =  ((uint32_t)header_raw[0] << 24) | 	 // Decode total_size (Big-Endian)
-                                         ((uint32_t)header_raw[1] << 16) |
-                                         ((uint32_t)header_raw[2] << 8)  |
-                                                    header_raw[3];
-                    header.packet_id = (header_raw[4] << 8) | header_raw[5]; // uart sends in a big endian format (MSB first) then
-                    header.payload_length = (header_raw[6] << 8) | header_raw[7]; // we shift them back into a single 16-bit integer
+		case State::READ_HEADER: {
+			static uint8_t header_raw[8];
+			header_raw[bytes_read++] = byte;
+			if (bytes_read == 8) {
+				header.total_size =  ((uint32_t)header_raw[0] << 24) | 	 // Decode total_size (Big-Endian)
+						((uint32_t)header_raw[1] << 16) |
+						((uint32_t)header_raw[2] << 8)  |
+						header_raw[3];
+        		header.packet_id = (header_raw[4] << 8) | header_raw[5]; // uart sends in a big endian format (MSB first) then
+        		header.payload_length = (header_raw[6] << 8) | header_raw[7]; // we shift them back into a single 16-bit integer
 
-                    // DEFENSIVE SAFEGUARD: Prevent malicious or malformed packets from crashing RAM
-                    if (header.payload_length > 512) {
-                    	header.payload_length = 512;
-                    }
+        		// DEFENSIVE SAFEGUARD: Prevent malicious or malformed packets from crashing RAM
+        		if (header.payload_length > 512) {
+        			header.payload_length = 512;
+        		}
 
-                    bytes_read = 0;
-                    current_state = State::READ_DATA;
-                }
-                break;
-            }
+        		bytes_read = 0;
+        		current_state = State::READ_DATA;
+        	}
+        	break;
+        }
 
-            case State::READ_DATA: {
-                payload_buffer[bytes_read++] = byte;
+        case State::READ_DATA: {
+        	payload_buffer[bytes_read++] = byte;
 
-                if (bytes_read == header.payload_length) {
-                    bytes_read = 0;
-                    current_state = State::READ_CRC;
-                }
-                break;
-            }
+        	if (bytes_read == header.payload_length) {
+        		bytes_read = 0;
+        		current_state = State::READ_CRC;
+        	}
+        	break;
+        }
 
-            case State::READ_CRC: {
-                static uint8_t crc_raw[4];
-                crc_raw[bytes_read++] = byte;
+        case State::READ_CRC: {
+        	static uint8_t crc_raw[4];
+        	crc_raw[bytes_read++] = byte;
 
-                if (bytes_read == 4) {
-                	incoming_crc = ((uint32_t)crc_raw[0] << 24) |
-                			((uint32_t)crc_raw[1] << 16) |
-							((uint32_t)crc_raw[2] << 8)  |
-							crc_raw[3];
+        	if (bytes_read == 4) {
+        		incoming_crc = ((uint32_t)crc_raw[0] << 24) |
+        				((uint32_t)crc_raw[1] << 16) |
+						((uint32_t)crc_raw[2] << 8)  |
+						crc_raw[3];
 
-                	execute_flash_and_respond();  // Process the flash operations immediatly
-                	bytes_read = 0;
-                	current_state = State::IDLE_START; // Reset variables for the next incoming packet
-                }
-                break;
-            }
+        		execute_flash_and_respond();  // Process the flash operations immediatly
+        		bytes_read = 0;
+        		current_state = State::IDLE_START; // Reset variables for the next incoming packet
+        	}
+        	break;
+        }
         }
     }
 }
@@ -578,6 +604,26 @@ static void jump_to_application(uint32_t target_app_addr) {
     }
 }
 
+static void GPIO__Interrupt() {
+    // 1. Enable GPIOA Clock (and SYSCFG clock for interrupt routing)
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+    // 2. Set PA0 as Input Mode (00 in MODER)
+    //GPIOA->MODER &= ~GPIO_MODER_MODER0;
+
+    // 3. Clear and map EXTI0 line to Port A (0000 in EXTICR[0])
+    SYSCFG->EXTICR[0] &= ~(0xF<<0);
+
+    // 4. Configure EXTI Line 0 (Unmask + Set Rising Edge Trigger)
+    EXTI->IMR  |= EXTI_IMR_IM0;     // Unmask interrupt line 0
+    EXTI->RTSR |= EXTI_RTSR_TR0;    // Trigger on rising edge (button press)
+    EXTI->FTSR &= ~EXTI_FTSR_TR0;   // Disable falling edge trigger
+
+    // 5. Enable the Interrupt in the NVIC
+    NVIC_SetPriority(EXTI0_IRQn, 2); // Set lower priority than critical UART/DMA
+    NVIC_EnableIRQ(EXTI0_IRQn);
+}
 //===================================================================
 // =================== MAIN () ======================================
 //===================================================================
@@ -597,29 +643,76 @@ int main() {
 		// The sector 13 must be initialized at 0xFF at the first use after programming
 		format_sector13_fresh(STATE_RUN_BANK1); // Force a clean format (bank x [...0xFF...0xFF...] magic_nb)
 	}
-	// 2. Read our persistent flash marker
-	uint8_t boot_state = get_active_bank_choice();
+
+	uint8_t boot_state = get_active_bank_choice(); // 2. Read our persistent flash marker
 
 	// 3. Condition Check: Only jump if we are NOT forcing an update!
 	if (boot_state == STATE_RUN_BANK1 || boot_state == STATE_RUN_BANK2) {
-		// jump_to_application() handles remapping internally based on current execution bank
 		jump_to_application(BANK1_APP_START_ADDR);
 	}
 
-    // 4.  Wait for firmware update
-    BareM_StatusTypeDef res = uart3.init(115200);
-    while(res != Bare_OK);
+	else if(boot_state == STATE_FORCE_UPDATE) {
+		GPIO__Interrupt();
+		// 4.  Wait for firmware update
+		BareM_StatusTypeDef res = uart3.init(115200);
+		while(res != Bare_OK);
 
-    uart3.startReceiveToIdle_DMA(buffer_rx);
+		uart3.startReceiveToIdle_DMA(buffer_rx);
 
-    while (true) {
+		while (true) {
+			// Active watchdog check for mid-transfer abandonment
+			if (transfer_in_progress && (ms_since_last_packet > INACTIVITY_TIMEOUT_MS)) {
+				while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
+				while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
+				__disable_irq();
+				NVIC_SystemReset(); // Purge state and reboot cleanly
+			}
 
-    	GPIOD->ODR ^= GPIO_ODR_OD4;
-    	NBdelay_ms(150); // blink wait to receive the uart bytes
+			GPIOD->ODR ^= GPIO_ODR_OD4;
+			NBdelay_ms(150); // blink wait to receive the uart bytes
 
+		}
+		return 0;
+	}
+}
+
+extern "C" void EXTI0_IRQHandler(void) {
+    // Check if the interrupt came from line 0
+	if (EXTI->PR & (1<<0)) {  // button pushed : if the PA0 triggered the interrupt
+
+        // Safety check: Only escape if we are actively waiting for an update file
+        // (This prevents accidental button presses from wiping states at wrong times)
+        uint8_t current_boot_state = get_active_bank_choice();
+
+        if (current_boot_state == STATE_FORCE_UPDATE) {
+
+            // 1. Find the last running valid bank choice
+            uint8_t fallback_bank = STATE_RUN_BANK1; // Default
+            uint32_t address = SECTOR13_START;
+
+            while (address < SECTOR13_END) {
+                if (*reinterpret_cast<volatile uint8_t*>(address) == 0xFF) {
+                    break;
+                }
+                address++;
+            }
+
+            // Step back 2 bytes (past the 0x0A) to find the old working bank
+            if (address >= (SECTOR13_START + 2)) {
+                fallback_bank = *reinterpret_cast<volatile uint8_t*>(address - 2);
+            }
+
+            record_new_bank_state(fallback_bank); // Write Sector 13 to store the fallback bank byte after the 0x0A
+
+            // 3. Clean down and reboot
+            __disable_irq(); // Prevent other interrupts from breaking the restart
+            EXTI->PR = EXTI_PR_PR0; // Clear pending flag just in case
+            while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
+            while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
+            NVIC_SystemReset(); // Reboot directly out of the loop!
+        }
+        EXTI->PR = (1<<0);  // Clear the interrupt flag by writing a 1
     }
-
-    return 0;
 }
 
 
