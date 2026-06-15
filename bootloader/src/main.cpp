@@ -36,6 +36,7 @@ struct PacketHeader {
     uint32_t total_size;
     uint16_t packet_id;		 // packet_id increments but we track only the first
     uint16_t payload_length;
+    uint32_t total_crc;
 };
 
 struct FlashSectorMap {
@@ -47,6 +48,8 @@ struct FlashSectorMap {
 constexpr uint8_t PACKET_START_BYTE = 0x02;
 constexpr uint8_t ACK_BYTE          = 0x06;
 constexpr uint8_t NAK_BYTE          = 0x15;
+constexpr uint8_t EOF_BYTE          = 0x21;
+constexpr uint8_t ERR_BYTE          = 0xEE;
 
 // Explicit constants for our boot tracking state machine
 constexpr uint8_t STATE_RUN_BANK1      = 1;
@@ -109,7 +112,7 @@ inline constexpr std::array<FlashSectorMap, 12> bank2_sectors{{
 // ============================================================================
 // Global or static tracking variables
 volatile State current_state = State::IDLE_START;
-PacketHeader header = {0, 0, 0};
+PacketHeader header = {0, 0, 0, 0};
 uint8_t payload_buffer[512]; // Matches our max expected packet size
 uint32_t incoming_crc = 0;
 uint32_t bytes_read = 0;
@@ -123,6 +126,7 @@ static int16_t last_erased_sector         = -1;  // -1 means nothing erased yet 
 static uint32_t current_flash_address     = 0; // no longer hard-coded (0x08100000U)
 static bool target_is_bank2               = true;
 static uint32_t tot_fw_bytes_written      = 0; // keep track of the written bits
+static uint32_t expected_firmware_crc = 0; // Global tracking variable
 
 //===================================================================
 // =================== Functions Flash ==============================
@@ -292,7 +296,14 @@ static bool program_packet_to_flash(uint32_t start_address, std::span<const uint
 
         // Attempt bare-metal physical write
         if (!flash_write(target_address, word)) {
-            return false; // Hardware write failure
+        	return false; // Hardware write failure
+        }
+        // Immediate read-back verification
+        // Directly sample the physical Flash memory address
+        uint32_t written_word = *reinterpret_cast<volatile uint32_t*>(target_address);
+        if (written_word != word) {
+        	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ERR_BYTE), 1));
+        	return false; // Flash verification mismatch! Silicon/Data corruption detected.
         }
         // Advance physical flash pointer forward by exactly 1 word (4 bytes)
         target_address += 4;
@@ -317,6 +328,7 @@ void execute_flash_and_respond() {
     // 2. Reset tracking fields cleanly if this is the absolute beginning of a transfer
     if (header.packet_id == 1) {							// first packet
     	tot_fw_bytes_written = 0; // Reset tracking counter (robustness: avoid accumulating values if transfer has crashed)
+    	expected_firmware_crc = header.total_crc; // Capture the total_crc token once at the start
     	uint8_t active_bank = get_active_bank_choice();
 
     	// If we are currently in a forced update state, find out what the underlying active bank was
@@ -360,7 +372,7 @@ void execute_flash_and_respond() {
     // Choose the correct sector lookup table based on our target bank
     if (target_is_bank2) {
     	// Search backwards from the highest sector to the lowest
-    	for (int i = bank2_sectors.size() - 1; i >= 0; --i) {
+    	for (int i = static_cast<int>(bank2_sectors.size()) - 1; i >= 0; --i) {
     		if (packet_end_address >= bank2_sectors[i].start_address) {
     			target_sector = bank2_sectors[i].sector_number;
     			sector_found = true;
@@ -373,9 +385,9 @@ void execute_flash_and_respond() {
     	}
     } else {
     	// Search backwards from the highest sector to the lowest
-    	for (int i = bank2_sectors.size() - 1; i >= 0; --i) {
-    		if (packet_end_address >= bank2_sectors[i].start_address) {
-    			target_sector = bank2_sectors[i].sector_number;
+    	for (int i = static_cast<int>(bank1_sectors.size()) - 1; i >= 0; --i) {
+    		if (packet_end_address >= bank1_sectors[i].start_address) {
+    			target_sector = bank1_sectors[i].sector_number;
     			sector_found = true;
     			break; // Stop immediately! We found the highest matching boundary.
     		}
@@ -409,33 +421,47 @@ void execute_flash_and_respond() {
     std::span<const uint8_t> payload_span(payload_buffer, header.payload_length);
 
     if (program_packet_to_flash(current_flash_address, payload_span)) {
-        current_flash_address += header.payload_length;  		// Advance the flash pointer forward by the actual bytes written
-        tot_fw_bytes_written += header.payload_length;  // Track the total written progress
+    	current_flash_address += header.payload_length;  		// Advance the flash pointer forward by the actual bytes written
+    	tot_fw_bytes_written += header.payload_length;  // Track the total written progress
 
-        // 3. Check if this was the absolute last packet of the file
-        if (tot_fw_bytes_written >= header.total_size) {
-            // The update is 100% complete, written and verified. Now it is safe to change the boot choice
-            uint8_t bank_choice = (target_is_bank2) ? 0x02 : 0x01;
-            record_new_bank_state(bank_choice); // update the new bank number the app will run onto
-            flash_lock();
-            tot_fw_bytes_written = 0; // Reset counter for the next future update session
-            transfer_in_progress = 0;
-            uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
-            // Clean the hardware pipeline before leaving
-            while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
-            while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
-            __disable_irq(); // Nothing can interrupt the reboot
-            NVIC_SystemReset(); // Reboot
-        }
-        // If the transfer is interrupted, the 0x0A (force update) flag stays active in Sector 13, meaning if the board reboots,
-        // it safely stays in the bootloader waiting for you to restart sending the FW instead of jumping into a corrupted application
-        // Send ACK (0x06) to pull the next chunk from the PC
-        uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
+    	// 3. Check if this was the absolute last packet of the file
+    	if (tot_fw_bytes_written >= header.total_size) {
+
+    		// Compute CRC over the entire physical flashed binary space
+    		uint32_t physical_flash_crc = CRC32_compute(reinterpret_cast<const uint8_t*>(target_bank_start_address), header.total_size);
+
+    		if (physical_flash_crc == expected_firmware_crc) {
+    			// The update is 100% complete, written and verified. Now it is safe to change the boot choice
+    			uint8_t bank_choice = (target_is_bank2) ? 0x02 : 0x01;
+    			record_new_bank_state(bank_choice); // update the new bank number the app will run onto
+    			flash_lock();
+    			tot_fw_bytes_written = 0; // Reset counter for the next future update session
+    			transfer_in_progress = 0;
+    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
+    			// Clean the hardware pipeline before leaving
+    			while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
+    			while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
+    			__disable_irq(); // Nothing can interrupt the reboot
+    			NVIC_SystemReset(); // Reboot
+    		} else {
+    			// MACRO IMAGE CORRUPTION DETECTED!
+    			// Do NOT write the new bank state to Sector 13.
+    			flash_lock();
+    			tot_fw_bytes_written = 0;
+    			transfer_in_progress = false;
+    			// Blast back a NAK or an explicit ERR_BYTE so Python flags a flashing failure
+    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ERR_BYTE), 1));
+    			return;
+    		}
+    	}
+    	// If the transfer is interrupted, the 0x0A (force update) flag stays active in Sector 13, meaning if the board reboots,
+    	// it safely stays in the bootloader waiting for you to restart sending the FW instead of jumping into a corrupted application
+    	// Send ACK (0x06) to pull the next chunk from the PC
+    	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
     } else {
-        // Hardware fault during programming
-        uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+    	// Hardware fault during programming
+    	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
     }
-
 }
 
 static void ParseIncomingStream(std::span<const uint8_t> incoming_chunk) {
@@ -456,15 +482,20 @@ static void ParseIncomingStream(std::span<const uint8_t> incoming_chunk) {
 		}
 
 		case State::READ_HEADER: {
-			static uint8_t header_raw[8];
+			static uint8_t header_raw[12];
 			header_raw[bytes_read++] = byte;
-			if (bytes_read == 8) {
-				header.total_size =  ((uint32_t)header_raw[0] << 24) | 	 // Decode total_size (Big-Endian)
-						((uint32_t)header_raw[1] << 16) |
-						((uint32_t)header_raw[2] << 8)  |
-						header_raw[3];
-        		header.packet_id = (header_raw[4] << 8) | header_raw[5]; // uart sends in a big endian format (MSB first) then
+
+			if (bytes_read == 12) {
+				header.total_size	 =  ((uint32_t)header_raw[0] << 24) | 	 // Decode total_size (Big-Endian)
+										((uint32_t)header_raw[1] << 16) |
+										((uint32_t)header_raw[2] << 8)  |
+										header_raw[3];
+        		header.packet_id	  = (header_raw[4] << 8) | header_raw[5]; // uart sends in a big endian format (MSB first) then
         		header.payload_length = (header_raw[6] << 8) | header_raw[7]; // we shift them back into a single 16-bit integer
+        		header.total_crc	  = ((uint32_t)header_raw[8]  << 24) |
+										((uint32_t)header_raw[9]  << 16) |
+										((uint32_t)header_raw[10] << 8)  |
+										  header_raw[11];
 
         		// DEFENSIVE SAFEGUARD: Prevent malicious or malformed packets from crashing RAM
         		if (header.payload_length > 512) {

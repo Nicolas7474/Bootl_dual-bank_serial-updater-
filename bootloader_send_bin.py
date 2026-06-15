@@ -2,8 +2,35 @@ import os
 import sys
 import time
 import struct
-import zlib  # zlib.crc32 perfectly matches the STM32 Hardware CRC32 (Poly: 0x04C11DB7, Init: 0xFFFFFFFF)
+import zlib  # zlib.crc32
 import serial
+import struct
+from crccheck.crc import Crc
+
+# Define the exact mathematical footprint of the STM32F4 Hardware CRC unit
+class Stm32HardwareCrc(Crc):
+    _poly = 0x04C11DB7
+    _initvalue = 0xFFFFFFFF
+    _reflect_input = False   # STM32F4 hardware doesn't reverse input bits
+    _reflect_output = False  # STM32F4 hardware doesn't reverse output bits
+    _finalxor = 0x00000000   # STM32F4 hardware doesn't invert the final result
+
+def calc_stm32_hw_crc32(data: bytes) -> int:
+    """
+    Computes a CRC32 that matches the raw, unreflected 32-bit word 
+    hardware calculation of the STM32F4 peripheral.
+    Data MUST be padded to a multiple of 4 bytes.
+    """
+    # 1. Enforce 32-bit alignment (Safety check, though your script already pads raw_data)
+    remainder = len(data) % 4
+    if remainder != 0:
+        data += b'\xFF' * (4 - remainder)
+        
+    # 2. STM32 processes data as 32-bit words. Because UART streams bytes sequentially,
+    # we must ensure our byte-ordering mimics how the STM32 reads from its data register.
+    # We pass the bytes directly to our custom unreflected engine.
+    #return Stm32HardwareCrc.calc(data)
+
 
 # Protocol Constants
 PACKET_START_BYTE = b'\x02'
@@ -11,6 +38,11 @@ ACK_BYTE = b'\x06'
 NAK_BYTE = b'\x15'
 PAYLOAD_MAX_SIZE = 512
 
+data = b"123456789"
+
+crc = Crc.calc(data)
+
+print(hex(crc))
 
 def calc_stm32_crc32(data: bytes) -> int:
     """
@@ -39,8 +71,11 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
         total_size = len(raw_data)
         print(f"Padded binary with {padding_needed} bytes for 32-bit word alignment.")
 
+    # Calculate CRC32 for this specific payload block
+    total_crc = calc_stm32_crc32(raw_data)
+
     print(f"Opening port {port_name} at {baudrate} baud...")
-    print(f"Preparing to send binary file: {bin_file_path} ({total_size} bytes total)")
+    print(f"Preparing to send binary file: {bin_file_path} ({total_size} bytes total)")   
 
     try:
         # Open serial port with a timeout to prevent hanging forever on dropped ACKs
@@ -56,7 +91,7 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
     # 2. Slice file and transmit sequential packets
     bytes_sent = 0
     packet_id = 1
-    
+
     # Generate chunks:
     # list where every element is a bytes object 512 bytes long (except for the last one)
     chunks = [raw_data[i:i + PAYLOAD_MAX_SIZE] for i in range(0, total_size, PAYLOAD_MAX_SIZE)]
@@ -72,7 +107,7 @@ def send_firmware(port_name: str, baudrate: int, bin_file_path: str):
 
         # Build Header string using Big-Endian packing formats:
         # >IHH -> '>' Big-Endian, 'I' uint32 (4 bytes), 'H' uint16 (2 bytes), 'H' uint16 (2 bytes)
-        header_bytes = struct.pack(">IHH", total_size, packet_id, payload_len)
+        header_bytes = struct.pack(">IHHI", total_size, packet_id, payload_len, total_crc)
         
         # Build CRC tracking suffix, because you cannot
         # just send or concatenate a raw integer to a bytes object
