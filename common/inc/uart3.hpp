@@ -1,3 +1,8 @@
+/* STM32F469
+******* UART3 - C++ Bare-Metal Driver - Interrupts and DMA based  **
+******* with COBS option
+******** See usage example for IT and DMA in main.c  ****************/
+
 #pragma once
 
 #include "stm32f469xx.h"
@@ -6,7 +11,6 @@
 #include <cstdint>      // For fixed-width integer types (uint8_t, uint32_t)
 #include <array>        // For std::array
 #include <span>         // For std::span
-#include <string_view>  // For std::string_view
 
 
 // Clean, type-safe status definitions using modern C++ enums
@@ -26,11 +30,11 @@ namespace Uart {
 using UartLowLevelInitFn = void(*)(void); // Function pointer type for hardware-specific low-level setup (GPIO/Clocks)
 
 struct UartHardwareConfig { 	// Compile-time configuration structure holding immutable hardware parameters
-    USART_TypeDef* 		 usart;
-    DMA_Stream_TypeDef*  rxStream;
-    DMA_Stream_TypeDef*  txStream;
+    USART_TypeDef* usart;
+    DMA_Stream_TypeDef* rxStream;
+    DMA_Stream_TypeDef* txStream;
     uint32_t             dmaChannel;
-    DMA_TypeDef* 		 dmaBase;
+    DMA_TypeDef* dmaBase;
     IRQn_Type            usartIrq;
     IRQn_Type            txDmaIrq;
     UartLowLevelInitFn   lowLevelInit; // Uniquely binds the GPIO setup to the instance
@@ -59,12 +63,18 @@ class UartDriver {
 	friend void DMA1_Stream3_IRQHandler(void);
 
 private:
+    enum class LinkState : uint8_t {
+        Idle,
+        Polling,
+        Interrupt,
+        DMA
+    };  // Instead of a single 'currentMode' and 'status', create independent tracking enums
+
+    volatile LinkState tx_link = LinkState::Idle; // Controls the TX wire
+    volatile LinkState rx_link = LinkState::Idle; // Controls the RX wire
+
     const UartHardwareConfig config;  // Permanent, read-only configuration for this specific instance
     bool isDmaInitialized = false;    // Guard flag for single-run execution
-
-    // Explicit internal software state flags (guaranteed type-safe)
-    volatile UartMode currentMode;
-    volatile uint8_t status = Uart::Idle;
 
     // Internal buffers and trackers
     static constexpr size_t BufferSize = 1024;  // Matching the DMA length (NDTR)
@@ -95,21 +105,25 @@ public:
     // Public API Methods
     BareM_StatusTypeDef init(uint32_t baudrate);
 
-    BareM_StatusTypeDef UART_Transmit_IT(std::string_view message);
+    BareM_StatusTypeDef UART_Transmit(std::span<const uint8_t> message, uint32_t timeout_ms);
+    BareM_StatusTypeDef UART_Receive(std::span<uint8_t> user_buffer, uint32_t timeout_ms);
+    BareM_StatusTypeDef UART_Transmit_IT(std::span<const uint8_t> message);
     BareM_StatusTypeDef UART_Receive_IT(std::span<uint8_t> user_buffer, bool waitIfBusy = true);
-    BareM_StatusTypeDef UART_Transmit_DMA(std::string_view message);
+    BareM_StatusTypeDef UART_Transmit_DMA(std::span<const uint8_t> message);
     BareM_StatusTypeDef startReceiveToIdle_DMA(std::span<uint8_t> user_buffer); // Pass the callback directly when starting the listener
     BareM_StatusTypeDef stopReceiveToIdle_DMA();
 
     uint16_t getRxBufferIndex() const { return rxMaxLen_DMA - config.rxStream->NDTR;} // getter for the ISR to access NDTR
 
     // Clean, public "getter" functions for the application layer
-    bool isUartIdle() 	const { return (status & Uart::Idle)   == 0; }
-    bool isUartBusy() const { return ((status & Uart::BusyTx) || (status & Uart::BusyRx)) != 0; }
-    bool isRxComplete() const { return (status & Uart::RxComplete) != 0; }
-    void clearRxComplete() { status &= ~Uart::RxComplete; }
+    // Replace lines 112-115 with these updated, link-state tracking getters:
+    bool isUartIdle() const {
+        return tx_link == LinkState::Idle && rx_link == LinkState::Idle;
+    }
+    bool isUartBusy() const {
+        return tx_link != LinkState::Idle || rx_link != LinkState::Idle;
+    }
 
 };
 
 extern UartDriver uart3; // Declares the global driver instance to make it visible to the application
-

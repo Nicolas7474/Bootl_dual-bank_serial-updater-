@@ -1,7 +1,7 @@
-/* 		  STM32F469
-*******   UART3 - C++ Bare-Metal Driver - Interrupts and DMA based  **
-*******   with COBS option
-********  See usage example for IT and DMA in main.c  ****************/
+/* STM32F469
+******* UART3 - C++ Bare-Metal Driver - Interrupts and DMA based  **
+******* with COBS option
+******** See usage example for IT and DMA in main.c  ****************/
 
 #include "../inc/uart3.hpp"   // Always include its own header first
 
@@ -76,6 +76,10 @@ BareM_StatusTypeDef UartDriver::init(uint32_t baudrate) {
     // 8. Finalize Hardware Enables & Set Default Driver Flags
     config.usart->CR1 |= USART_CR1_RE | USART_CR1_TE;
 
+    // Explicitly initialize state links to prevent random memory states on bootup
+    this->tx_link = LinkState::Idle;
+    this->rx_link = LinkState::Idle;
+
     return Bare_OK;
 }
 
@@ -116,18 +120,21 @@ UartDriver uart3(Uart3Config); // Global Instance allocation in the memory secti
 // Functions DMA MODE
 // ============================================================================
 
-BareM_StatusTypeDef UartDriver::UART_Transmit_DMA(std::string_view message) {
-	// std::string_view automatically calculates the length and capture the pointer at zero runtime cost
+BareM_StatusTypeDef UartDriver::UART_Transmit_DMA(std::span<const uint8_t> message) {
+	// std::span cleanly captures data layout pointers at zero runtime cost
 	ConfigureDma();
 
     // Wait until the TX DMA stream is disabled and UART hardware shift register is empty (crucial)
     while ((config.txStream->CR & DMA_SxCR_EN) || !(config.usart->SR & USART_SR_TC));
-
+    // Check ONLY if the TX wire is busy. RX can be doing whatever it wants!
+    uint32_t timeout_counter = GetSysTick();
+    while (this->tx_link != LinkState::Idle) {
+    	if (GetSysTick() - timeout_counter > 5) return Bare_TIMEOUT;
+    }
     config.dmaBase->LIFCR = (0x3DUL << 22); // Clear out hardware flags from the previous transmission
     config.usart->SR &= ~USART_SR_TC; // Clear UART transmission complete flag
 
-    uart3.status = Uart::BusyTx;
-    uart3.currentMode = UartMode::DMA;
+    this->tx_link = LinkState::DMA; // Claim ONLY the TX highway
     uint16_t final_tx_length = 0;
 
 #if defined(USE_COBS)
@@ -136,16 +143,16 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_DMA(std::string_view message) {
     constexpr size_t maxRawInputSize = BufferSize - (BufferSize / 1021 + 1) - 1;
     size_t length_to_encode = std::min(message.size(), maxRawInputSize);
 
-    // Encode directly from the string_view data into your permanent asynchronous class buffer
+    // Encode directly from the span data into your permanent asynchronous class buffer
     cobs_encode_result encode_result = cobs_encode(
         txBuffer_DMA,
         BufferSize,
-        reinterpret_cast<const uint8_t*>(message.data()),
+        message.data(),
         length_to_encode
     );
 
     if (encode_result.status != COBS_ENCODE_OK) {
-        this->status = Uart::Idle; // Reset state machine on error
+    	this->tx_link = LinkState::Idle; // Reset state machine on error
         return Bare_ERROR;
     }
     // Append the mandatory framing delimiter zero marker at the end of the packet frame
@@ -153,7 +160,7 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_DMA(std::string_view message) {
         txBuffer_DMA[encode_result.out_len] = 0x00;
         final_tx_length = static_cast<uint16_t>(encode_result.out_len + 1);
     } else {
-        this->status = Uart::Idle;
+    	this->tx_link = LinkState::Idle;
         return Bare_ERROR; // Out of bounds safety check
     }
 
@@ -162,7 +169,7 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_DMA(std::string_view message) {
     size_t length = std::min(message.size(), BufferSize);
     // Because DMA transmissions happen asynchronously in the background while the CPU moves on,
     // you cannot point the DMA directly to message.data(). If you do, the DMA might transmit corrupted stack memory
-    std::memcpy(txBuffer_DMA, message.data(), length); // Decouples the memory by copying the string into a dedicated, permanent internal class buffer
+    std::memcpy(txBuffer_DMA, message.data(), length); // Decouples the memory by copying the span into a dedicated, permanent internal class buffer
     final_tx_length = static_cast<uint16_t>(length);
 #endif
 
@@ -197,9 +204,7 @@ BareM_StatusTypeDef UartDriver::startReceiveToIdle_DMA(std::span<uint8_t> user_b
     this->pRxUserBuffer_DMA = user_buffer.data();
     this->rxMaxLen_DMA = static_cast<uint16_t>(user_buffer.size());
 
-    // Update modern C++ driver state machine
-    this->status = Uart::BusyRx;
-    this->currentMode = UartMode::DMA;
+    this->rx_link = LinkState::DMA;
     this->last_rx_read_index = 0;
 
     // Configure memory addresses and buffer lengths natively via span
@@ -258,7 +263,7 @@ BareM_StatusTypeDef UartDriver::stopReceiveToIdle_DMA() {
     volatile uint32_t dummy_dr = config.usart->DR;
     (void)dummy_sr; (void)dummy_dr;
 
-    this->status &= ~Uart::BusyRx; // Update software status state
+    this->rx_link = LinkState::Idle;
     return Bare_OK;
 }
 
@@ -266,14 +271,14 @@ BareM_StatusTypeDef UartDriver::stopReceiveToIdle_DMA() {
 // Functions INTERRUPT MODE
 // ============================================================================
 
-BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::string_view message) {
+BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::span<const uint8_t> message) {
 	uint32_t timeout_counter = GetSysTick();
-	while (!this->isUartIdle()) {
+	// Check ONLY if the TX wire is busy. RX can be doing whatever it wants!
+	while (this->tx_link != LinkState::Idle) {
 		if (GetSysTick() - timeout_counter > 5) return Bare_TIMEOUT;
 	}
 
-	this->status = Uart::BusyTx;
-	this->currentMode = UartMode::Interrupt;
+	this->tx_link = LinkState::Interrupt; // Claim ONLY the TX highway
 	this->tx_index_IT = 0;
 
 	#if defined(USE_COBS)
@@ -282,16 +287,16 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::string_view message) {
 		constexpr size_t maxRawInputSize = BufferSize - (BufferSize / 1021 + 1) - 1; // BufferSize is fully known at compile time (this-> is not)
 	    size_t length_to_encode = std::min(message.size(), maxRawInputSize);
 
-	    // Encode directly from the string_view data into the persistent interrupt buffer
+	    // Encode directly from the span data into the persistent interrupt buffer
 	    cobs_encode_result encode_result = cobs_encode(
 	        txInterruptBuffer.data(),
 	        txInterruptBuffer.size(),
-	        reinterpret_cast<const uint8_t*>(message.data()),
+	        message.data(),
 	        length_to_encode
 	    );
 
 	    if (encode_result.status != COBS_ENCODE_OK) {
-	        this->status = Uart::Idle; // Reset state machine on failure
+	    	this->tx_link = LinkState::Idle; // Reset state machine on failure
 	        return Bare_ERROR;
 	    }
 
@@ -300,7 +305,7 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::string_view message) {
 	        txInterruptBuffer[encode_result.out_len] = 0x00;
 	        this->tx_len_IT = static_cast<uint16_t>(encode_result.out_len + 1);
 	    } else {
-	        this->status = Uart::Idle;
+	    	this->tx_link = LinkState::Idle;
 	        return Bare_ERROR; // Out of bounds safety check
 	    }
 	#else
@@ -308,7 +313,7 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::string_view message) {
 	    size_t length = std::min(message.size(), txInterruptBuffer.size()); // Clip length safely to prevent buffer overflows
 	    this->tx_len_IT = static_cast<uint16_t>(length);
 	    // Modern C++ copy mechanism
-	    std::copy_n(reinterpret_cast<const uint8_t*>(message.data()), length, txInterruptBuffer.begin());
+	    std::copy_n(message.data(), length, txInterruptBuffer.begin());
 	#endif
 
 	config.usart->SR &= ~USART_SR_TC;  // TC flag is cleared before enabling interrupts. This step is important, as TC might still be set from a previous transmission.
@@ -321,22 +326,21 @@ BareM_StatusTypeDef UartDriver::UART_Transmit_IT(std::string_view message) {
 BareM_StatusTypeDef UartDriver::UART_Receive_IT(std::span<uint8_t> user_buffer, bool waitIfBusy) {
 	if (user_buffer.empty()) return Bare_ERROR;
 
-	while (this->status & Uart::BusyRx) {
+	uint32_t timeout_counter = GetSysTick();
+	while (this->rx_link != LinkState::Idle) {
 		if (waitIfBusy) {
-			uint32_t timeout_counter = GetSysTick();
 			if (GetSysTick() - timeout_counter > 10) {
 				return Bare_TIMEOUT; // Unjams the CPU and reports the issue!
 			}
-			else return Bare_BUSY; // Act like the ST HAL: Return immediately if busy
+		} else {
+			return Bare_BUSY; // Act like the ST HAL: Return immediately if busy
 		}
 	}
 	// Bind the runtime buffer destinations
 	this->pRxUserBuffer_IT = user_buffer.data();
     this->rxMaxLen_IT = static_cast<uint16_t>(user_buffer.size());
 
-    // Set State Machine Flags
-    this->status |= Uart::BusyRx;
-    this->currentMode = UartMode::Interrupt;
+    this->rx_link = LinkState::Interrupt; // Claim ONLY the RX highway
 
     // Unmask the hardware interrupts to allow reception now
     config.usart->CR1 |= (USART_CR1_RXNEIE | USART_CR1_IDLEIE);
@@ -354,7 +358,6 @@ void DMA1_Stream1_IRQHandler(void) {		// Rx IRQHandler
     if (DMA1->LISR & DMA_LISR_TCIF1) {
     	DMA1->LIFCR = DMA_LIFCR_CTCIF1; 	// Clear Transfer Complete flag
     	uart3.invalidateAndFlushRx();
-    	//uart3.status = Uart::RxComplete | Uart::Idle; // add 16 + 1 to cleared status (=)
     }
     if (DMA1->LISR & DMA_LISR_HTIF1) {
     	DMA1->LIFCR = DMA_LIFCR_CHTIF1;
@@ -365,17 +368,19 @@ void DMA1_Stream1_IRQHandler(void) {		// Rx IRQHandler
 void DMA1_Stream3_IRQHandler(void) {		// Tx IRQHandler
 	if (DMA1->LISR & DMA_LISR_TCIF3) {
 		DMA1->LIFCR = DMA_LIFCR_CTCIF3; 	// Clear TX Transfer Complete
-		uart3.status = Uart::TxComplete | Uart::Idle; // add 16 + 1 to cleared status (=)
+	/*	Because LinkState is defined inside the private/protected scope of the UartDriver class, global functions
+		cannot see it as a standalone type. They must access it using class scope resolution: UartDriver::LinkState::Idle. */
+		uart3.tx_link = UartDriver::LinkState::Idle; // Release TX link status
 	}
 }
 
 void USART3_IRQHandler() {
 
-	if(uart3.currentMode == UartMode::Interrupt)
-	{
+	// HANDLE RX EVENTS
+	if (uart3.rx_link == UartDriver::LinkState::Interrupt) {
 		// receive UART bytes
 		if (uart3.config.usart->SR & USART_SR_RXNE) { // 'Receive register not empty' interrupt; RXNE is cleared by a read to the USART_DR register
-			uart3.status |= Uart::BusyRx;
+			uart3.rx_link = UartDriver::LinkState::Interrupt;
 			uart3.pRxUserBuffer_IT[uart3.count_rx_IT] = uart3.config.usart->DR;    // Copy new data into the buffer
 			uart3.count_rx_IT = uart3.count_rx_IT + 1;
 			if (uart3.count_rx_IT >= uart3.rxMaxLen_IT) uart3.count_rx_IT = 0;  // Prevent overflowing the 1024-byte bufferRx array
@@ -387,7 +392,7 @@ void USART3_IRQHandler() {
 			dummy = uart3.config.usart->DR; (void)dummy; 	// Clear IDLE flag (Read SR then DR)
 			// Turn off interrupts to close the reception window (Matches HAL style)
 			uart3.config.usart->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_IDLEIE);
-			uart3.status = Uart::RxComplete | Uart::Idle;
+			uart3.rx_link = UartDriver::LinkState::Idle; // Clear RX link state separately!
 			// Execute callback if there is data collected and the pointer is valid
 			if (uart3.count_rx_IT > 0 && uart3.rxCallback_IT != nullptr) {
 				// Pass exactly the slice of bytes that arrived
@@ -395,10 +400,22 @@ void USART3_IRQHandler() {
 			}
 			uart3.count_rx_IT = 0;
 		}
+	}
+	else if (uart3.rx_link == UartDriver::LinkState::DMA) {
+		if (uart3.config.usart->SR & USART_SR_IDLE) {
+			// Safely clear IDLE flag and flush data
+			volatile uint32_t dummy = uart3.config.usart->SR | uart3.config.usart->DR; (void)dummy;
+			uart3.invalidateAndFlushRx();
+			// Keep rx_link as LinkState::DMA because circular background listening continues!
+		}
+	}
+
+	// 2. HANDLE TX EVENTS
+	if (uart3.tx_link == UartDriver::LinkState::Interrupt) {
 		// send UART bytes
-		else if((uart3.config.usart->CR1 & USART_CR1_TXEIE) && (uart3.config.usart->SR & USART_SR_TXE)) {
+		if ((uart3.config.usart->CR1 & USART_CR1_TXEIE) && (uart3.config.usart->SR & USART_SR_TXE)) {
 			if (uart3.tx_index_IT < uart3.tx_len_IT) {
-				uart3.status = Uart::BusyTx;
+				uart3.tx_link = UartDriver::LinkState::Interrupt;
 				uart3.config.usart->DR = uart3.txInterruptBuffer[uart3.tx_index_IT]; // Read and assign, then modify and write back safely
 				uart3.tx_index_IT = uart3.tx_index_IT + 1;  // Avoid the warning: '++' expression of 'volatile'-qualified type is deprecated
 			}
@@ -410,23 +427,13 @@ void USART3_IRQHandler() {
 			}
 		}
 		// This bit is set by hw if the transmit of a frame is complete and if TXE is set.
-		else if (uart3.config.usart->SR & USART_SR_TC && uart3.config.usart->CR1 & USART_CR1_TCIE) {
+		else if ((uart3.config.usart->SR & USART_SR_TC) && (uart3.config.usart->CR1 & USART_CR1_TCIE)) {
 			uart3.config.usart->SR &= ~USART_SR_TC; // clear USART_SR_TC;
 			uart3.config.usart->CR1 &= ~USART_CR1_TCIE;
-			uart3.status = Uart::TxComplete | Uart::Idle;
+			uart3.tx_link = UartDriver::LinkState::Idle;
 		}
 	}
 
-	if (uart3.currentMode == UartMode::DMA) {
-	    if (uart3.config.usart->SR & USART_SR_IDLE) {
-	        // Clear IDLE flag safely
-	    	volatile uint32_t dummy = uart3.config.usart->SR | uart3.config.usart->DR;
-	        (void)dummy;
-	        // Flush data to the callback immediately
-	        uart3.invalidateAndFlushRx();
-	        uart3.status |= Uart::RxComplete;
-	    }
-	}
 	// Aggressive error clearing
 	if (uart3.config.usart->SR & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
 		GPIOD->ODR ^= GPIO_ODR_OD5;
@@ -440,3 +447,86 @@ void USART3_IRQHandler() {
 } // extern "C"
 
 
+// ============================================================================
+// Functions POLLING MODE
+// ============================================================================
+
+BareM_StatusTypeDef UartDriver::UART_Transmit(std::span<const uint8_t> message, uint32_t timeout_ms) {
+    if (message.empty()) return Bare_OK;
+
+    // 1. Synchronize: Wait for any asynchronous TX operations (DMA/IT) to complete
+    uint32_t start_tick = GetSysTick();
+    while (this->tx_link != UartDriver::LinkState::Idle) {
+        if (GetSysTick() - start_tick > timeout_ms) return Bare_TIMEOUT;
+    }
+
+    // 2. Claim the TX highway for Polling
+    this->tx_link = UartDriver::LinkState::Polling;
+
+    // 3. Clear the hardware Transmission Complete flag before beginning
+    config.usart->SR &= ~USART_SR_TC;
+
+    // 4. Loop through each character in the span
+    for (uint8_t b : message) {
+        // Wait for Transmit Data Register to be Empty (TXE)
+        while (!(config.usart->SR & USART_SR_TXE)) {
+            if (GetSysTick() - start_tick > timeout_ms) {
+                this->tx_link = UartDriver::LinkState::Idle; // Release line on error
+                return Bare_TIMEOUT;
+            }
+        }
+        // Write byte directly to the Data Register
+        config.usart->DR = b;
+    }
+
+    // 5. Wait for the final character to shift completely off the wire (TC)
+    while (!(config.usart->SR & USART_SR_TC)) {
+        if (GetSysTick() - start_tick > timeout_ms) {
+            this->tx_link = UartDriver::LinkState::Idle;
+            return Bare_TIMEOUT;
+        }
+    }
+
+    // 6. Release the highway
+    this->tx_link = UartDriver::LinkState::Idle;
+    return Bare_OK;
+}
+
+BareM_StatusTypeDef UartDriver::UART_Receive(std::span<uint8_t> user_buffer, uint32_t timeout_ms) {
+    if (user_buffer.empty()) return Bare_ERROR;
+
+    // 1. Synchronize: Wait for any active asynchronous RX operations to yield
+    uint32_t start_tick = GetSysTick();
+    while (this->rx_link != UartDriver::LinkState::Idle) {
+        if (GetSysTick() - start_tick > timeout_ms) return Bare_TIMEOUT;
+    }
+
+    // 2. Claim the RX highway for Polling
+    this->rx_link = UartDriver::LinkState::Polling;
+
+    // 3. Step through user buffer and fill it byte-by-byte
+    for (size_t i = 0; i < user_buffer.size(); ++i) {
+        // Wait for Read Data Register Not Empty (RXNE) flag
+        while (!(config.usart->SR & USART_SR_RXNE)) {
+
+            // Check for hardware overrun/noise/framing errors while waiting and clear them
+            if (config.usart->SR & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
+                volatile uint32_t dummy_sr = config.usart->SR;
+                volatile uint32_t dummy_dr = config.usart->DR;
+                (void)dummy_sr; (void)dummy_dr;
+            }
+
+            if (GetSysTick() - start_tick > timeout_ms) {
+                this->rx_link = UartDriver::LinkState::Idle; // Release line on error
+                return Bare_TIMEOUT;
+            }
+        }
+
+        // Read byte directly from Data Register (clears RXNE automatically)
+        user_buffer[i] = static_cast<uint8_t>(config.usart->DR);
+    }
+
+    // 4. Release the highway
+    this->rx_link = UartDriver::LinkState::Idle;
+    return Bare_OK;
+}

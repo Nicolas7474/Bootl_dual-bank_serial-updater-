@@ -252,7 +252,7 @@ static void format_sector13_fresh(uint8_t initial_state) {
 	if (!flash_erase_sector(13)) {
 		// HARDWARE ERASE FAULT: Stop everything!
 		flash_lock();
-		uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+		uart3.UART_Transmit(std::span<const uint8_t>(&NAK_BYTE, 1), 500);
 		return; // Break out of execution early to prevent programming un-erased memory
 	}
 	flash_write(SECTOR13_START, initial_state);  // Write the starting bank choice at the very first byte
@@ -302,7 +302,7 @@ static bool program_packet_to_flash(uint32_t start_address, std::span<const uint
         // Directly sample the physical Flash memory address
         uint32_t written_word = *reinterpret_cast<volatile uint32_t*>(target_address);
         if (written_word != word) {
-        	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ERR_BYTE), 1));
+        	uart3.UART_Transmit(std::span<const uint8_t>(&ERR_BYTE, 1), 500);
         	return false; // Flash verification mismatch! Silicon/Data corruption detected.
         }
         // Advance physical flash pointer forward by exactly 1 word (4 bytes)
@@ -321,7 +321,7 @@ void execute_flash_and_respond() {
     uint32_t computed_crc = CRC32_compute(payload_buffer, header.payload_length);
 
     if (computed_crc != incoming_crc) {
-        uart3.UART_Transmit_IT(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+    	uart3.UART_Transmit(std::span<const uint8_t>(&NAK_BYTE, 1), 500);
         return;
     }
 
@@ -410,7 +410,7 @@ void execute_flash_and_respond() {
     		if (!flash_erase_sector(target_sector)) {
     			// HARDWARE ERASE FAULT: Stop everything!
     			flash_lock();
-    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+    			uart3.UART_Transmit(std::span<const uint8_t>(&NAK_BYTE, 1), 500);
     			return; // Break out of execution early to prevent programming un-erased memory
     		}
     		last_erased_sector = static_cast<int16_t>(target_sector);
@@ -437,9 +437,9 @@ void execute_flash_and_respond() {
     			flash_lock();
     			tot_fw_bytes_written = 0; // Reset counter for the next future update session
     			transfer_in_progress = 0;
-    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
+    			uart3.UART_Transmit(std::span<const uint8_t>(&ACK_BYTE, 1), 500);
     			// Clean the hardware pipeline before leaving
-    			while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: wait for DMA Stream to turn off
+    			//while ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0); // Crucial: if used, wait for DMA Stream to turn off
     			while ((USART3->SR & USART_SR_TC) == 0);  // Wait for USART Transmission Complete (TC) flag
     			__disable_irq(); // Nothing can interrupt the reboot
     			NVIC_SystemReset(); // Reboot
@@ -450,17 +450,17 @@ void execute_flash_and_respond() {
     			tot_fw_bytes_written = 0;
     			transfer_in_progress = false;
     			// Blast back a NAK or an explicit ERR_BYTE so Python flags a flashing failure
-    			uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE_BYTE), 1));
+    			uart3.UART_Transmit(std::span<const uint8_t>(&NAK_BYTE, 1), 500);
     			return;
     		}
     	}
     	// If the transfer is interrupted, the 0x0A (force update) flag stays active in Sector 13, meaning if the board reboots,
     	// it safely stays in the bootloader waiting for you to restart sending the FW instead of jumping into a corrupted application
     	// Send ACK (0x06) to pull the next chunk from the PC
-    	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&ACK_BYTE), 1));
+    	uart3.UART_Transmit(std::span<const uint8_t>(&ACK_BYTE, 1), 500);
     } else {
     	// Hardware fault during programming
-    	uart3.UART_Transmit_DMA(std::string_view(reinterpret_cast<const char*>(&NAK_BYTE), 1));
+    	uart3.UART_Transmit(std::span<const uint8_t>(&NAK_BYTE, 1), 500);
     }
 }
 
@@ -545,13 +545,6 @@ void UART_RxCpltCallback_DMA(std::span<const uint8_t> incoming_data){
      // Process data inside the ISR, not a problem since the PC waits for the ACK after 512 bytes
      // and not other process is supposed to run in parallel
     ParseIncomingStream(incoming_data);
-
-/*    std::string_view tx_view(
-            reinterpret_cast<const char*>(incoming_data.data()),
-            incoming_data.size()
-        );*/
-
-    //uart3.UART_Transmit_DMA(tx_view);
 }
 
 void UART_RxCpltCallback_IT([[maybe_unused]] std::span<const uint8_t> incoming_data) {}

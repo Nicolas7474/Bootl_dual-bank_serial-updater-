@@ -104,9 +104,11 @@ int main() {
 
 
 	// char sel[4] = "oi ";
-	char se = get_active_bank_choice();
-	char ascii_bank = se + '0';
-	uart3.UART_Transmit_IT(&ascii_bank);
+	uint8_t se = get_active_bank_choice();
+	// Create a small local buffer to back up the data safely
+	std::array<uint8_t, 1> tx_buffer = { static_cast<uint8_t>(se + '0') };
+	// Pass the span cleanly. Note: Ensure tx_buffer remains in scope until the Tx completes!
+	uart3.UART_Transmit(tx_buffer, 200);
 
 	NBdelay_ms(500);
     GPIOG->ODR ^= GPIO_ODR_OD6;
@@ -114,7 +116,8 @@ int main() {
 
     while (true) {
     	NBdelay_ms(3000);
-    	uart3.UART_Transmit_IT(&ascii_bank);
+
+    	uart3.UART_Transmit(tx_buffer, 200);
     }
     return 0;
 }
