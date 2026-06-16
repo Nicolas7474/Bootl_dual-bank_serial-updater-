@@ -1,5 +1,5 @@
 /* STM32F469
-******* UART3 - C++ Bare-Metal Driver - Interrupts and DMA based  **
+******* UART3 - C++ Bare-Metal Driver - Polling, Interrupts and DMA based  **
 ******* with COBS option
 ******** See usage example for IT and DMA in main.c  ****************/
 
